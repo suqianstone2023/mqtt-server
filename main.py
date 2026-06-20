@@ -43,6 +43,8 @@ class DataPersistService:
         self.cur = None
         self.client = None
         self._is_running = False
+        self._accepting_messages = False
+        self._stop_requested = False
         self.db_writer_thread = None
 
     def start(self):
@@ -51,12 +53,16 @@ class DataPersistService:
             return True
 
         self._is_running = True
+        self._accepting_messages = True
+        self._stop_requested = False
         self.logger.info("正在初始化服务...")
 
         try:
             self._connect_db()
         except Exception as e:
-            self.logger.error(f"数据库连接失败，服务未启动: {e}")
+            # 修复 Windows 环境下的 GBK 编码崩溃问题，让真正的错误暴露
+            err_str = str(e).encode('utf-8', errors='replace').decode('utf-8')
+            self.logger.error(f"依赖连接失败，服务未启动: {err_str}")
             self._is_running = False
             return False
 
@@ -82,15 +88,19 @@ class DataPersistService:
     def stop(self):
         if not self._is_running:
             return
-        self._is_running = False
+        self._accepting_messages = False
+        self._stop_requested = True
         self.logger.info("正在停止服务...")
 
         if self.client:
-            self.client.disconnect()
+            try:
+                self.client.disconnect()
+            except Exception as e:
+                self.logger.warning(f"停止 MQTT 客户端时出现异常: {e}")
 
         if self.db_writer_thread:
             self.logger.info("发送停止信号给写库线程...")
-            # 优化：确保哨兵进入队列，限制最多重试30次(约3秒)，并加入微睡眠防止CPU空转
+            # 确保哨兵进入队列，写库线程在消费完已有数据后再退出。
             inserted = False
             retry_count = 0
 
@@ -105,28 +115,25 @@ class DataPersistService:
                     except queue.Empty:
                         # 队列突然空了却还是 put 失败？极小概率事件，直接跳出
                         break
-                    # 防止写库线程彻底卡死时，主线程在这里高频空转消耗 CPU
                     time.sleep(0.1)
                 retry_count += 1
 
             if not inserted:
                 self.logger.error("无法将停止信号插入队列，写库线程可能已僵死！")
 
-            self.db_writer_thread.join(timeout=5)
+            self.db_writer_thread.join(timeout=10)
+            if self.db_writer_thread.is_alive():
+                self.logger.error("写库线程未能在超时前退出，数据库连接将交由线程自行清理。")
+            else:
+                self.logger.info("写库线程已退出")
 
         if self.client:
-            self.client.loop_stop()
+            try:
+                self.client.loop_stop()
+            except Exception as e:
+                self.logger.warning(f"停止 MQTT 网络循环时出现异常: {e}")
 
-        # 彻底释放连接资源
-        try:
-            if self.cur: self.cur.close()
-        except Exception:
-            pass
-        try:
-            if self.conn and not self.conn.closed: self.conn.close()
-        except Exception:
-            pass
-        self.logger.info("数据库连接已关闭")
+        self._is_running = False
         self.logger.info("服务已完全停止")
 
     def _connect_db(self):
@@ -140,12 +147,17 @@ class DataPersistService:
         except Exception:
             pass
 
-        self.conn = psycopg2.connect(
-            connect_timeout=5,
-            **self.config["db_config"]
-        )
-        self.cur = self.conn.cursor()
-        self.logger.info("PostgreSQL连接成功")
+        try:
+            self.conn = psycopg2.connect(
+                connect_timeout=5,
+                **self.config["db_config"]
+            )
+            self.cur = self.conn.cursor()
+            self.logger.info("PostgreSQL连接成功")
+        except Exception as e:
+            err_str = str(e).encode('utf-8', errors='replace').decode('utf-8')
+            self.logger.error(f"PostgreSQL连接失败: {err_str}")
+            raise
 
     def parse_meter(self, raw):
         try:
@@ -207,56 +219,80 @@ class DataPersistService:
         batch_size = max(1, int(self.config["batch_size"]))
         flush_interval = max(1, int(self.config["flush_interval"]))
         pending_retry_batch = None
+        shutdown_received = False
 
-        while True:
-            # 只要主线程叫停 (_is_running=False)，立刻丢弃重试任务，强制退出！彻底杜绝僵尸线程
-            if not self._is_running:
+        try:
+            while True:
                 if pending_retry_batch:
-                    self.logger.error("服务已停止，丢弃无法写入的重试批次数据！")
-                    pending_retry_batch = None
-                if batch:
-                    if not self._execute_db_write(batch):
-                        self.logger.error("退出前最后一次写入失败，数据丢弃！")
-                break
+                    success = self._execute_db_write(pending_retry_batch)
+                    if success:
+                        pending_retry_batch = None
+                    elif self._stop_requested:
+                        self.logger.error("服务停止中，重试批次最终写入失败，数据已丢弃！")
+                        pending_retry_batch = None
+                    else:
+                        time.sleep(5)
+                        continue
 
-            # 优先处理需要重试的失败批次
-            if pending_retry_batch:
-                success = self._execute_db_write(pending_retry_batch)
-                if success:
-                    pending_retry_batch = None
-                else:
-                    time.sleep(5)
-                    continue
+                try:
+                    item = self.data_queue.get(timeout=1)
+                    if item is _SHUTDOWN_SENTINEL:
+                        shutdown_received = True
+                    else:
+                        batch.append(item)
+                        if len(batch) == 1:
+                            last_flush_time = time.time()
+                except queue.Empty:
+                    pass
 
-            # 从队列获取新数据
-            try:
-                item = self.data_queue.get(timeout=1)
-                if item is _SHUTDOWN_SENTINEL:
-                    if batch:
-                        self._execute_db_write(batch)
+                current_time = time.time()
+                should_flush = (
+                    batch and (
+                        len(batch) >= batch_size
+                        or (
+                            last_flush_time is not None
+                            and current_time - last_flush_time >= flush_interval
+                        )
+                        or shutdown_received
+                    )
+                )
+
+                if should_flush:
+                    success = self._execute_db_write(batch)
+                    if success:
+                        batch.clear()
+                    elif shutdown_received or self._stop_requested:
+                        self.logger.error("停止阶段最后一批数据写入失败，数据已丢弃！")
+                        batch.clear()
+                    else:
+                        pending_retry_batch = batch[:]
+                        batch.clear()
+                    last_flush_time = current_time if batch else None
+
+                if shutdown_received and not batch and pending_retry_batch is None:
                     break
-                batch.append(item)
+        finally:
+            self._close_db_resources()
+            self._is_running = False
+            self._accepting_messages = False
+            self.logger.info("数据库连接已关闭")
 
-                if len(batch) == 1:
-                    last_flush_time = time.time()
-            except queue.Empty:
-                pass
+    def _close_db_resources(self):
+        try:
+            if self.cur:
+                self.cur.close()
+        except Exception:
+            pass
+        finally:
+            self.cur = None
 
-            # 检查是否达到批量写入条件
-            current_time = time.time()
-            if len(batch) >= batch_size or (
-                    batch
-                    and last_flush_time is not None
-                    and current_time - last_flush_time >= flush_interval
-            ):
-                success = self._execute_db_write(batch)
-                if success:
-                    batch.clear()
-                    last_flush_time = current_time
-                else:
-                    pending_retry_batch = batch[:]
-                    batch.clear()
-                    last_flush_time = current_time
+        try:
+            if self.conn and not self.conn.closed:
+                self.conn.close()
+        except Exception:
+            pass
+        finally:
+            self.conn = None
 
     def _execute_db_write(self, rows):
         if not self.conn or self.conn.closed:
@@ -286,7 +322,8 @@ class DataPersistService:
             self.logger.info(f"批量写入 {len(rows)} 条成功，耗时: {cost_time:.2f} 毫秒")
             return True
         except Exception as e:
-            self.logger.error(f"批量写入失败: {e}")
+            err_str = str(e).encode('utf-8', errors='replace').decode('utf-8')
+            self.logger.error(f"批量写入失败: {err_str}")
             try:
                 if self.conn: self.conn.rollback()
                 if self.conn: self.conn.close()
@@ -315,7 +352,8 @@ class DataPersistService:
             self.logger.error(f"MQTT连接失败，错误码: {reason_code}")
 
     def _on_message(self, client, userdata, msg):
-        if not self._is_running: return
+        if not self._accepting_messages:
+            return
 
         try:
             payload = msg.payload.decode("utf-8")
@@ -324,11 +362,16 @@ class DataPersistService:
             receive_time = datetime.now(timezone.utc)
 
             for i in range(1, 11):
+                if not self._accepting_messages:
+                    break
+
                 key = f"k{i}"
                 raw = data.get(key)
-                if not raw: continue
+                if not raw:
+                    continue
                 meter = self.parse_meter(raw)
-                if meter is None: continue
+                if meter is None:
+                    continue
 
                 row = (
                     receive_time, gateway, meter["carrier"], meter["meter_addr"],
@@ -369,6 +412,8 @@ class AppGUI:
     def setup_logger(self):
         self.logger = logging.getLogger("MqttApp")
         self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+        self.logger.handlers.clear()
 
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
@@ -455,17 +500,48 @@ class AppGUI:
         self.log_text.config(state=tk.DISABLED)
 
     def get_config(self):
+        broker = self.entry_broker.get().strip()
+        topic = self.entry_topic.get().strip()
+        db_host = self.entry_db_host.get().strip()
+        db_name = self.entry_db_name.get().strip()
+        db_user = self.entry_db_user.get().strip()
+
+        if not broker:
+            raise ValueError("MQTT Broker 不能为空")
+        if not topic:
+            raise ValueError("MQTT 主题不能为空")
+        if not db_host:
+            raise ValueError("数据库 IP 不能为空")
+        if not db_name:
+            raise ValueError("数据库库名不能为空")
+        if not db_user:
+            raise ValueError("数据库用户不能为空")
+
+        mqtt_port = int(self.entry_mqtt_port.get().strip())
+        db_port = int(self.entry_db_port.get().strip())
+        batch_size = int(self.entry_batch_size.get().strip())
+        flush_interval = int(self.entry_flush_interval.get().strip())
+
+        if not 1 <= mqtt_port <= 65535:
+            raise ValueError("MQTT 端口必须在 1-65535 之间")
+        if not 1 <= db_port <= 65535:
+            raise ValueError("数据库端口必须在 1-65535 之间")
+        if batch_size <= 0:
+            raise ValueError("批量大小必须大于 0")
+        if flush_interval <= 0:
+            raise ValueError("刷库间隔必须大于 0")
+
         return {
-            "broker": self.entry_broker.get(),
-            "port": self.entry_mqtt_port.get(),
-            "topic": self.entry_topic.get(),
-            "batch_size": self.entry_batch_size.get(),
-            "flush_interval": self.entry_flush_interval.get(),
+            "broker": broker,
+            "port": mqtt_port,
+            "topic": topic,
+            "batch_size": batch_size,
+            "flush_interval": flush_interval,
             "db_config": {
-                "host": self.entry_db_host.get(),
-                "port": self.entry_db_port.get(),
-                "database": self.entry_db_name.get(),
-                "user": self.entry_db_user.get(),
+                "host": db_host,
+                "port": db_port,
+                "database": db_name,
+                "user": db_user,
                 "password": self.entry_db_pass.get()
             }
         }
@@ -484,7 +560,12 @@ class AppGUI:
         self.btn_stop.config(state=state_disabled)
 
     def start_service(self):
-        config = self.get_config()
+        try:
+            config = self.get_config()
+        except ValueError as e:
+            self.logger.error(f"配置校验失败: {e}")
+            return
+
         self.service = DataPersistService(config, self.logger)
 
         self.toggle_ui_state(True)
