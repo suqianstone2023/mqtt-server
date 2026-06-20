@@ -5,6 +5,7 @@ import time
 import threading
 import queue
 import logging
+import os
 from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values
@@ -37,7 +38,8 @@ class DataPersistService:
         self.config = config
         self.logger = logger
         self.carrier_map = {1: "联通", 2: "电信", 3: "移动"}
-        self.data_queue = queue.Queue(maxsize=20000)
+        self.raw_queue = queue.Queue(maxsize=self.config["raw_queue_size"])
+        self.data_queue = queue.Queue(maxsize=self.config["row_queue_size"])
 
         self.conn = None
         self.cur = None
@@ -46,6 +48,24 @@ class DataPersistService:
         self._accepting_messages = False
         self._stop_requested = False
         self.db_writer_thread = None
+        self.parser_threads = []
+        self.stats_thread = None
+        self._stats_lock = threading.Lock()
+        self._warn_state = {}
+        self.stats = {
+            "mqtt_received": 0,
+            "raw_enqueued": 0,
+            "raw_dropped": 0,
+            "messages_processed": 0,
+            "messages_failed": 0,
+            "meters_parsed": 0,
+            "meters_invalid": 0,
+            "rows_enqueued": 0,
+            "rows_dropped": 0,
+            "db_batches": 0,
+            "db_rows_written": 0,
+            "db_write_failures": 0
+        }
 
     def start(self):
         if self._is_running:
@@ -66,8 +86,20 @@ class DataPersistService:
             self._is_running = False
             return False
 
+        self.parser_threads = []
+        for index in range(self.config["parser_workers"]):
+            parser_thread = threading.Thread(
+                target=self._parser_loop,
+                name=f"parser-{index + 1}",
+                daemon=True
+            )
+            parser_thread.start()
+            self.parser_threads.append(parser_thread)
+
         self.db_writer_thread = threading.Thread(target=self._db_writer_loop, daemon=True)
         self.db_writer_thread.start()
+        self.stats_thread = threading.Thread(target=self._stats_loop, daemon=True)
+        self.stats_thread.start()
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self._on_connect
@@ -76,8 +108,13 @@ class DataPersistService:
         self.client.reconnect_delay_set(min_delay=1, max_delay=120)
 
         self.logger.info(f"正在连接MQTT Broker: {self.config['broker']}...")
+        self.logger.info(
+            f"高吞吐模式已启用: parser_workers={self.config['parser_workers']}, "
+            f"raw_queue={self.config['raw_queue_size']}, row_queue={self.config['row_queue_size']}, "
+            f"batch_size={self.config['batch_size']}"
+        )
         try:
-            self.client.connect(self.config["broker"], int(self.config["port"]), 60)
+            self.client.connect(self.config["broker"], self.config["port"], 60)
             self.client.loop_start()
             return True
         except Exception as e:
@@ -98,29 +135,15 @@ class DataPersistService:
             except Exception as e:
                 self.logger.warning(f"停止 MQTT 客户端时出现异常: {e}")
 
+        self._push_sentinel(self.raw_queue, "解析队列", len(self.parser_threads))
+        for parser_thread in self.parser_threads:
+            parser_thread.join(timeout=10)
+            if parser_thread.is_alive():
+                self.logger.error(f"{parser_thread.name} 未能在超时前退出")
+
         if self.db_writer_thread:
             self.logger.info("发送停止信号给写库线程...")
-            # 确保哨兵进入队列，写库线程在消费完已有数据后再退出。
-            inserted = False
-            retry_count = 0
-
-            while not inserted and retry_count < 30:
-                try:
-                    self.data_queue.put_nowait(_SHUTDOWN_SENTINEL)
-                    inserted = True
-                except queue.Full:
-                    try:
-                        self.data_queue.get_nowait()
-                        self.logger.warning("停止服务时队列已满，丢弃1条旧数据以插入退出信号")
-                    except queue.Empty:
-                        # 队列突然空了却还是 put 失败？极小概率事件，直接跳出
-                        break
-                    time.sleep(0.1)
-                retry_count += 1
-
-            if not inserted:
-                self.logger.error("无法将停止信号插入队列，写库线程可能已僵死！")
-
+            self._push_sentinel(self.data_queue, "写库队列", 1)
             self.db_writer_thread.join(timeout=10)
             if self.db_writer_thread.is_alive():
                 self.logger.error("写库线程未能在超时前退出，数据库连接将交由线程自行清理。")
@@ -133,8 +156,47 @@ class DataPersistService:
             except Exception as e:
                 self.logger.warning(f"停止 MQTT 网络循环时出现异常: {e}")
 
+        if self.stats_thread:
+            self.stats_thread.join(timeout=2)
+
         self._is_running = False
         self.logger.info("服务已完全停止")
+
+    def _push_sentinel(self, target_queue, queue_name, count):
+        for _ in range(count):
+            inserted = False
+            retry_count = 0
+            while not inserted and retry_count < 30:
+                try:
+                    target_queue.put_nowait(_SHUTDOWN_SENTINEL)
+                    inserted = True
+                except queue.Full:
+                    try:
+                        target_queue.get_nowait()
+                        self._log_warning_limited(
+                            f"{queue_name}_full_on_shutdown",
+                            f"停止服务时{queue_name}已满，丢弃1条旧数据以插入退出信号",
+                            interval=3
+                        )
+                    except queue.Empty:
+                        break
+                    time.sleep(0.1)
+                retry_count += 1
+
+            if not inserted:
+                self.logger.error(f"无法将停止信号插入{queue_name}，相关线程可能已僵死！")
+
+    def _update_stats(self, **kwargs):
+        with self._stats_lock:
+            for key, value in kwargs.items():
+                self.stats[key] = self.stats.get(key, 0) + value
+
+    def _log_warning_limited(self, key, message, interval=5):
+        now = time.time()
+        last_time = self._warn_state.get(key, 0)
+        if now - last_time >= interval:
+            self._warn_state[key] = now
+            self.logger.warning(message)
 
     def _connect_db(self):
         # 重连前彻底清理旧游标和连接
@@ -168,12 +230,14 @@ class DataPersistService:
                 self.logger.warning(
                     f"数据包长度异常(仅支持62或66, 实际{len(raw)}): {raw}"
                 )
+                self._update_stats(meters_invalid=1)
                 return None
 
             # 提前验证 HEX，避免高频异常捕获开销
             valid_hex = set('0123456789ABCDEF')
             if not all(c in valid_hex for c in raw):
                 self.logger.warning(f"数据包含非十六进制字符: {raw}")
+                self._update_stats(meters_invalid=1)
                 return None
 
             meter_addr = int(raw[0:2], 16)
@@ -194,6 +258,7 @@ class DataPersistService:
                     self.logger.warning(
                         f"非法浮点数: {block}"
                     )
+                    self._update_stats(meters_invalid=1)
                     return None
 
                 values.append(
@@ -211,13 +276,67 @@ class DataPersistService:
             }
         except Exception as e:
             self.logger.error(f"解析异常: {repr(e)}")
+            self._update_stats(meters_invalid=1)
             return None
+
+    def _parser_loop(self):
+        while True:
+            try:
+                item = self.raw_queue.get(timeout=1)
+            except queue.Empty:
+                if self._stop_requested:
+                    break
+                continue
+
+            if item is _SHUTDOWN_SENTINEL:
+                break
+
+            gateway, payload, receive_time = item
+
+            try:
+                data = json.loads(payload)
+                gateway = data.get("MAC", gateway or "Unknown")
+                self._update_stats(messages_processed=1)
+
+                parsed_count = 0
+                for i in range(1, 11):
+                    key = f"k{i}"
+                    raw = data.get(key)
+                    if not raw:
+                        continue
+
+                    meter = self.parse_meter(raw)
+                    if meter is None:
+                        continue
+
+                    row = (
+                        receive_time, gateway, meter["carrier"], meter["meter_addr"],
+                        meter["voltage"], meter["current"], meter["power"],
+                        meter["power_factor"], meter["frequency"], meter["energy"],
+                        meter["load_rate"]
+                    )
+                    try:
+                        self.data_queue.put(row, block=True, timeout=1)
+                        parsed_count += 1
+                    except queue.Full:
+                        self._update_stats(rows_dropped=1)
+                        self._log_warning_limited(
+                            "row_queue_full",
+                            "写库队列已满，当前解析结果被丢弃",
+                            interval=3
+                        )
+
+                if parsed_count:
+                    self._update_stats(meters_parsed=parsed_count, rows_enqueued=parsed_count)
+            except Exception as e:
+                self._update_stats(messages_failed=1)
+                self.logger.error(f"消息处理失败: {e}")
 
     def _db_writer_loop(self):
         batch = []
         last_flush_time = None
-        batch_size = max(1, int(self.config["batch_size"]))
-        flush_interval = max(1, int(self.config["flush_interval"]))
+        batch_size = self.config["batch_size"]
+        flush_interval = self.config["flush_interval"]
         pending_retry_batch = None
         shutdown_received = False
 
@@ -242,6 +361,16 @@ class DataPersistService:
                         batch.append(item)
                         if len(batch) == 1:
                             last_flush_time = time.time()
+                        while len(batch) < batch_size:
+                            try:
+                                item = self.data_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
+                            if item is _SHUTDOWN_SENTINEL:
+                                shutdown_received = True
+                                break
+                            batch.append(item)
                 except queue.Empty:
                     pass
 
@@ -319,10 +448,12 @@ class DataPersistService:
             )
             self.conn.commit()
             cost_time = (time.time() - start_time) * 1000
+            self._update_stats(db_batches=1, db_rows_written=len(rows))
             self.logger.info(f"批量写入 {len(rows)} 条成功，耗时: {cost_time:.2f} 毫秒")
             return True
         except Exception as e:
             err_str = str(e).encode('utf-8', errors='replace').decode('utf-8')
+            self._update_stats(db_write_failures=1)
             self.logger.error(f"批量写入失败: {err_str}")
             try:
                 if self.conn: self.conn.rollback()
@@ -356,34 +487,20 @@ class DataPersistService:
             return
 
         try:
+            self._update_stats(mqtt_received=1)
             payload = msg.payload.decode("utf-8")
-            data = json.loads(payload)
-            gateway = data.get("MAC", "Unknown")
             receive_time = datetime.now(timezone.utc)
-
-            for i in range(1, 11):
-                if not self._accepting_messages:
-                    break
-
-                key = f"k{i}"
-                raw = data.get(key)
-                if not raw:
-                    continue
-                meter = self.parse_meter(raw)
-                if meter is None:
-                    continue
-
-                row = (
-                    receive_time, gateway, meter["carrier"], meter["meter_addr"],
-                    meter["voltage"], meter["current"], meter["power"],
-                    meter["power_factor"], meter["frequency"], meter["energy"],
-                    meter["load_rate"]
+            try:
+                gateway_hint = getattr(msg, "topic", "Unknown")
+                self.raw_queue.put((gateway_hint, payload, receive_time), block=False)
+                self._update_stats(raw_enqueued=1)
+            except queue.Full:
+                self._update_stats(raw_dropped=1)
+                self._log_warning_limited(
+                    "raw_queue_full",
+                    "原始消息队列已满，当前 MQTT 消息被丢弃",
+                    interval=3
                 )
-
-                try:
-                    self.data_queue.put(row, block=True, timeout=2)
-                except queue.Full:
-                    self.logger.error("数据队列已满(超过2秒)，被迫丢弃当前数据！")
 
         except Exception as e:
             self.logger.error(f"消息处理失败: {e}")
@@ -391,6 +508,27 @@ class DataPersistService:
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
         if self._is_running:
             self.logger.warning(f"MQTT连接断开，准备重连...")
+
+    def _stats_loop(self):
+        report_interval = self.config["stats_interval"]
+        while not self._stop_requested:
+            time.sleep(report_interval)
+            if self._stop_requested:
+                break
+
+            with self._stats_lock:
+                snapshot = dict(self.stats)
+
+            self.logger.info(
+                "吞吐统计 "
+                f"mqtt={snapshot['mqtt_received']} raw_in={snapshot['raw_enqueued']} raw_drop={snapshot['raw_dropped']} "
+                f"msg_ok={snapshot['messages_processed']} msg_fail={snapshot['messages_failed']} "
+                f"meter_ok={snapshot['meters_parsed']} meter_bad={snapshot['meters_invalid']} "
+                f"row_in={snapshot['rows_enqueued']} row_drop={snapshot['rows_dropped']} "
+                f"db_batch={snapshot['db_batches']} db_row={snapshot['db_rows_written']} db_fail={snapshot['db_write_failures']} "
+                f"raw_q={self.raw_queue.qsize()}/{self.raw_queue.maxsize} "
+                f"row_q={self.data_queue.qsize()}/{self.data_queue.maxsize}"
+            )
 
 
 # ================= GUI 界面类 =================
@@ -531,12 +669,19 @@ class AppGUI:
         if flush_interval <= 0:
             raise ValueError("刷库间隔必须大于 0")
 
+        cpu_count = os.cpu_count() or 4
+        parser_workers = min(8, max(2, cpu_count))
+
         return {
             "broker": broker,
             "port": mqtt_port,
             "topic": topic,
             "batch_size": batch_size,
             "flush_interval": flush_interval,
+            "parser_workers": parser_workers,
+            "raw_queue_size": max(5000, batch_size * 10),
+            "row_queue_size": max(20000, batch_size * 20),
+            "stats_interval": 10,
             "db_config": {
                 "host": db_host,
                 "port": db_port,
